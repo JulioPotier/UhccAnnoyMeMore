@@ -20,12 +20,11 @@ local UHCCAMM = {
   posture = "stand", -- "stand" | "sit" | "lay" (best-effort; Classic clients can lack UnitStandState)
   lastEmoteToken = nil,
   hotFirstTickAt = {}, -- key -> last applied time (periodic heals: only first tick counts)
+  lastJumpFatigueAt = 0,
 }
 
 local function ensureDB()
   if type(UHCC_AnnoyMeMoreDB) ~= "table" then UHCC_AnnoyMeMoreDB = {} end
-  if type(UHCC_AnnoyMeMoreDB.enabled) ~= "boolean" then UHCC_AnnoyMeMoreDB.enabled = true end
-  if type(UHCC_AnnoyMeMoreDB.extraWarnings) ~= "boolean" then UHCC_AnnoyMeMoreDB.extraWarnings = true end
   if type(UHCC_AnnoyMeMoreDB.fatigueEnabled) ~= "boolean" then UHCC_AnnoyMeMoreDB.fatigueEnabled = false end
   if type(UHCC_AnnoyMeMoreDB.debugEnabled) ~= "boolean" then UHCC_AnnoyMeMoreDB.debugEnabled = false end
   if type(UHCC_AnnoyMeMoreDB.fatigueValue) ~= "number" then UHCC_AnnoyMeMoreDB.fatigueValue = nil end
@@ -38,19 +37,26 @@ local function ensureDB()
   if type(UHCC_AnnoyMeMoreDB.fatigueBarY) ~= "number" then UHCC_AnnoyMeMoreDB.fatigueBarY = -120 end
 end
 
-local function uhccammEnabled()
-  ensureDB()
-  return UHCC_AnnoyMeMoreDB.enabled == true
+-- Mirrors UltimateHardcoreChallengeUI `uhccAnnoyEnabled()` (Annoy me checkbox); do not modify that addon.
+local function uhccParentAnnoyEnabled()
+  if type(_G.UHCC_CharDB) ~= "table" then return false end
+  local s = _G.UHCC_CharDB.settings
+  if type(s) ~= "table" then return false end
+  return s["SETTINGS-ANNOY"] == true
 end
 
 local function uhccammFatigueEnabled()
   ensureDB()
-  return uhccammEnabled() and (UHCC_AnnoyMeMoreDB.fatigueEnabled == true)
+  return uhccParentAnnoyEnabled() and (UHCC_AnnoyMeMoreDB.fatigueEnabled == true)
 end
 
+-- Debug overlay is disabled for normal play. To work on it again, replace the body with the block below.
 local function uhccammDebugEnabled()
+  return false
+  --[[
   ensureDB()
-  return uhccammEnabled() and (UHCC_AnnoyMeMoreDB.debugEnabled == true)
+  return uhccParentAnnoyEnabled() and (UHCC_AnnoyMeMoreDB.debugEnabled == true)
+  ]]
 end
 
 local function uhccammPlayerLevel()
@@ -143,7 +149,7 @@ local function uhccammRestoreFatigueFromDB()
   if UHCCAMM.exhausted and (tonumber(UHCCAMM.fatigue) or 0) <= 0 then
     UHCCAMM.exhausted = false
   end
-  -- Safety: alert latch cannot persist below or equal to 90.
+  -- Stale tired-alert latch if fatigue is back in the safe zone (same rule as runtime: 90 or below).
   if UHCCAMM.exhaustedAlertLatched and (tonumber(UHCCAMM.fatigue) or 0) <= 90 then
     UHCCAMM.exhaustedAlertLatched = false
   end
@@ -175,6 +181,22 @@ local function uhccammApplyFatigueValue(v)
   uhccammSaveFatigueToDB(GetTime and GetTime())
 end
 
+local JUMP_FATIGUE_DEBOUNCE = 0.2
+local function uhccammApplyJumpFatigue()
+  if not uhccammFatigueEnabled() then return end
+  local now = (GetTime and GetTime()) or 0
+  if (now - (tonumber(UHCCAMM.lastJumpFatigueAt) or 0)) < JUMP_FATIGUE_DEBOUNCE then return end
+  UHCCAMM.lastJumpFatigueAt = now
+  local minV = uhccammHiddenStartValue()
+  UHCCAMM.fatigue = clamp((tonumber(UHCCAMM.fatigue) or minV) + 1, minV, uhccammFatigueMax())
+  if (not UHCCAMM.exhausted) and UHCCAMM.fatigue >= 110 then
+    UHCCAMM.exhausted = true
+  end
+  createFatigueBar()
+  updateFatigueBar()
+  uhccammSaveFatigueToDB(now)
+end
+
 local UHCCAMM_SLASH_WRAPPED = false
 local function uhccammTryWrapUhccSlash()
   if UHCCAMM_SLASH_WRAPPED then return true end
@@ -191,6 +213,10 @@ local function uhccammTryWrapUhccSlash()
     local low = string.lower(m)
     local n = low:match("^fatigue%s+(-?%d+)$")
     if n then
+      if not uhccammFatigueEnabled() then
+        print("|cffff3333UHCCAMM|r: Enable UHCC Annoy me, then Fatigue in Annoy Me More.")
+        return
+      end
       local iv = tonumber(n)
       if iv == nil then
         print("|cffff3333UHCCAMM|r: Usage: /uhcc fatigue n")
@@ -401,6 +427,7 @@ local function ensureExhaustedAlert()
   msg2:SetPoint("TOP", msg, "BOTTOM", 0, -10)
   msg2:SetTextColor(1, 0.65, 0.65, 1)
   msg2:SetText("You are exhausted")
+  msg2:Hide()
   f.msg2 = msg2
 
   f:Hide()
@@ -412,16 +439,39 @@ local function updateExhaustedAlert()
   local f = ensureExhaustedAlert()
   if not f then return end
 
+  if not uhccammFatigueEnabled() then
+    UHCCAMM.exhaustedAlertLatched = false
+    if f.msg2 then f.msg2:Hide() end
+    f:Hide()
+    return
+  end
+
   local fat = tonumber(UHCCAMM.fatigue) or 0
 
-  -- Latch when crossing 100+, clear when reaching 90 or below.
-  if (not UHCCAMM.exhaustedAlertLatched) and fat > 100 then
-    UHCCAMM.exhaustedAlertLatched = true
-  elseif UHCCAMM.exhaustedAlertLatched and fat <= 90 then
+  -- Always tear down overlay + latch once fatigue is 90 or below (no red screen / no chat line in that band).
+  if fat <= 90 then
     UHCCAMM.exhaustedAlertLatched = false
+    if f.msg2 then f.msg2:Hide() end
+    if f.bg then f.bg:SetColorTexture(1, 0, 0, 0.0) end
+    f:Hide()
+    return
+  end
+
+  -- Red overlay + "tired" from 100 fatigue upward while above 90.
+  if (not UHCCAMM.exhaustedAlertLatched) and fat >= 100 then
+    UHCCAMM.exhaustedAlertLatched = true
   end
 
   local keepShown = (UHCCAMM.exhaustedAlertLatched == true)
+
+  if f.msg2 then
+    if keepShown and (UHCCAMM.exhausted == true) then
+      f.msg2:Show()
+    else
+      f.msg2:Hide()
+    end
+  end
+
   if keepShown then
     if not f:IsShown() then
       if print then
@@ -432,6 +482,7 @@ local function updateExhaustedAlert()
     f:SetAlpha(1)
     if f.bg then f.bg:SetColorTexture(1, 0, 0, 0.22) end
   else
+    if f.msg2 then f.msg2:Hide() end
     f:Hide()
   end
 end
@@ -479,11 +530,6 @@ local function updateSpeedDebugText()
 
   local fs = ensureSpeedDebugText()
   if not fs then return end
-
-  if not uhccammFatigueEnabled() then
-    if UHCCAMM.speedFrame then UHCCAMM.speedFrame:Hide() end
-    return
-  end
 
   local d = UHCCAMM.debug or {}
   local spd = tonumber(d.speed) or 0
@@ -546,57 +592,62 @@ updateFatigueBar = function()
   updateExhaustedAlert()
 end
 
+local function uhccammCaptureDebugSnapshot()
+  local WALK_RUN_THRESHOLD = 4.0
+  local speed = (GetUnitSpeed and GetUnitSpeed("player")) or 0
+  speed = tonumber(speed) or 0
+  local moving = uhccammIsMoving()
+  UHCCAMM.isRunningNow = (speed > WALK_RUN_THRESHOLD) or (uhccammIsMounted() and moving)
+
+  local dbg = UHCCAMM.debug or {}
+  dbg.speed = speed
+  dbg.moving = moving
+  dbg.running = UHCCAMM.isRunningNow
+  dbg.mounted = uhccammIsMounted()
+  dbg.combat = uhccammIsInCombat()
+  dbg.resting = uhccammIsInInn()
+  dbg.hasUnitStandState = UnitStandState and true or false
+  dbg.hasUnitIsSitting = UnitIsSitting and true or false
+  dbg.stand = uhccammStandState()
+  dbg.sitting = uhccammIsSitting()
+  dbg.laying = uhccammIsLaying()
+  dbg.posture = UHCCAMM.posture
+  dbg.lastEmote = UHCCAMM.lastEmoteToken
+  dbg.lastHealText = dbg.lastHealText or nil
+  dbg.lastCleuText = dbg.lastCleuText or nil
+  dbg.delta = 0
+  dbg.restBonus = 0
+  dbg.speedBonus = 0
+  UHCCAMM.debug = dbg
+  return speed, moving
+end
+
 local function fatigueTick60()
+  --[[ Debug-only tick without Fatigue (disabled while uhccammDebugEnabled returns false):
+  if uhccammDebugEnabled() and not uhccammFatigueEnabled() then
+    uhccammCaptureDebugSnapshot()
+    updateSpeedDebugText()
+    return
+  end
+  ]]
+
   if not uhccammFatigueEnabled() then
     UHCCAMM.fatigue = uhccammHiddenStartValue()
     updateFatigueBar()
     return
   end
 
-  updateSpeedDebugText()
-
-  local speed = (GetUnitSpeed and GetUnitSpeed("player")) or 0
-  speed = tonumber(speed) or 0
-  local moving = uhccammIsMoving()
-
   -- Very simple v1 (rates are per second, applied at 60Hz):
   -- - running: 60s of running fills 100%  => +100/60 per sec
   -- - walking: slower than running (currently 90s to fill 100%) => +100/90 per sec
   -- - standing still: recover at the same speed as running by default (60s from 100 to 0) => -100/60 per sec
-  -- Threshold chosen to separate walk vs run in Classic (can be tuned later).
-  local WALK_RUN_THRESHOLD = 4.0
   local STEP = 1 / 60
   local RUN_PER_SEC = 100 / 60
   local WALK_PER_SEC = 100 / 90
   local REST_PER_SEC = 100 / 60
   local EXH_DELTA = 0.5 -- debuff: +0.5 fatigue, -0.5 regen
 
-  -- On mounts, we still want to treat movement as "running" even if speed reads 0 for some edge cases.
-  UHCCAMM.isRunningNow = (speed > WALK_RUN_THRESHOLD) or (uhccammIsMounted() and moving)
-
-  -- Debug snapshot (filled each tick).
-  do
-    local dbg = UHCCAMM.debug or {}
-    dbg.speed = speed
-    dbg.moving = moving
-    dbg.running = UHCCAMM.isRunningNow
-    dbg.mounted = uhccammIsMounted()
-    dbg.combat = uhccammIsInCombat()
-    dbg.resting = uhccammIsInInn()
-    dbg.hasUnitStandState = UnitStandState and true or false
-    dbg.hasUnitIsSitting = UnitIsSitting and true or false
-    dbg.stand = uhccammStandState()
-    dbg.sitting = uhccammIsSitting()
-    dbg.laying = uhccammIsLaying()
-    dbg.posture = UHCCAMM.posture
-    dbg.lastEmote = UHCCAMM.lastEmoteToken
-    dbg.lastHealText = dbg.lastHealText or nil
-    dbg.lastCleuText = dbg.lastCleuText or nil
-    dbg.delta = 0
-    dbg.restBonus = 0
-    dbg.speedBonus = 0
-    UHCCAMM.debug = dbg
-  end
+  local speed, moving = uhccammCaptureDebugSnapshot()
 
   if not moving then
     -- In combat, fatigue does not go down (even if you're standing still).
@@ -651,6 +702,89 @@ local function fatigueTick60()
 
   createFatigueBar()
   updateFatigueBar()
+  updateSpeedDebugText()
+end
+
+-- UHCC never refreshes `disabled` on external checkboxes when "Annoy me" toggles (unlike Money Management).
+-- We mirror that behavior: sync enable state + grey text, and clear our toggles when Annoy me turns off.
+local uhccammAnnoyCbHooked = nil
+
+local function uhccammSyncAnnoyDependentSettingsControls()
+  ensureDB()
+  local mf = _G.UHCC and UHCC.mainFrame
+  if not mf or type(mf.UHCC_settingsControls) ~= "table" then return end
+
+  local on = uhccParentAnnoyEnabled()
+  local keys = { "UHCCAMM-FATIGUE" } -- "UHCCAMM-DEBUG" removed while debug mode is hidden
+
+  if not on then
+    UHCC_AnnoyMeMoreDB.fatigueEnabled = false
+    UHCC_AnnoyMeMoreDB.debugEnabled = false
+    UHCCAMM.fatigue = uhccammHiddenStartValue()
+    if UHCCAMM.bar then setFatiguePanelShown(false) end
+    if UHCCAMM.speedFrame then UHCCAMM.speedFrame:Hide() end
+    createFatigueBar()
+    updateFatigueBar()
+  end
+
+  for _, key in ipairs(keys) do
+    local cb = mf.UHCC_settingsControls[key]
+    if cb and cb.SetEnabled then
+      cb:SetEnabled(on)
+      if cb.Text and cb.Text.SetTextColor then
+        if on then
+          cb.Text:SetTextColor(1, 1, 1, 1)
+        else
+          cb.Text:SetTextColor(0.7, 0.7, 0.7, 1)
+        end
+      end
+      if cb.SetChecked and key == "UHCCAMM-FATIGUE" then
+        cb:SetChecked(on and (UHCC_AnnoyMeMoreDB.fatigueEnabled == true))
+      end
+    end
+  end
+end
+
+local function uhccammHookAnnoyCheckboxIfNeeded()
+  local mf = _G.UHCC and UHCC.mainFrame
+  local annoy = mf and mf.UHCC_settingsControls and mf.UHCC_settingsControls["SETTINGS-ANNOY"]
+  if not annoy then return end
+  if annoy == uhccammAnnoyCbHooked then return end
+  uhccammAnnoyCbHooked = annoy
+  annoy:HookScript("OnClick", function()
+    local function run()
+      uhccammSyncAnnoyDependentSettingsControls()
+    end
+    if C_Timer and C_Timer.After then
+      C_Timer.After(0, run)
+    else
+      run()
+    end
+  end)
+end
+
+local function uhccammWrapUhccRebuildSettingsTabOnce()
+  local mf = _G.UHCC and UHCC.mainFrame
+  if not mf or mf.UHCCAMM_RebuildWrapped then return end
+  local orig = mf.UHCC_RebuildSettingsTab
+  if type(orig) ~= "function" then return end
+  mf.UHCCAMM_RebuildWrapped = true
+  mf.UHCC_RebuildSettingsTab = function(self, ...)
+    local ret = { orig(self, ...) }
+    uhccammAnnoyCbHooked = nil
+    uhccammHookAnnoyCheckboxIfNeeded()
+    uhccammSyncAnnoyDependentSettingsControls()
+    return unpack(ret)
+  end
+end
+
+local function uhccammTryInstallUhccSettingsHooksOnce()
+  local mf = _G.UHCC and UHCC.mainFrame
+  if not mf then return false end
+  uhccammWrapUhccRebuildSettingsTabOnce()
+  uhccammHookAnnoyCheckboxIfNeeded()
+  uhccammSyncAnnoyDependentSettingsControls()
+  return true
 end
 
 local function registerWithUHCC()
@@ -659,25 +793,8 @@ local function registerWithUHCC()
 
   _G.UHCC:RegisterSettingsProvider("Annoy Me More", function()
     ensureDB()
+    local parentAnnoy = uhccParentAnnoyEnabled()
     return {
-      {
-        kind = "checkbox",
-        key = "UHCCAMM-ENABLED",
-        label = "Enable Annoy Me More",
-        description = "Adds extra warning behaviors.",
-        get = function() return UHCC_AnnoyMeMoreDB.enabled end,
-        set = function(v) UHCC_AnnoyMeMoreDB.enabled = v and true or false end,
-      },
-      {
-        kind = "checkbox",
-        key = "UHCCAMM-EXTRA",
-        label = "Extra warnings",
-        description = "More popups/messages when you try restricted actions.",
-        get = function() return UHCC_AnnoyMeMoreDB.extraWarnings end,
-        set = function(v) UHCC_AnnoyMeMoreDB.extraWarnings = v and true or false end,
-        disabled = not UHCC_AnnoyMeMoreDB.enabled,
-        indent = 18,
-      },
       {
         kind = "checkbox",
         key = "UHCCAMM-FATIGUE",
@@ -692,13 +809,14 @@ local function registerWithUHCC()
             if UHCCAMM.speedFrame then UHCCAMM.speedFrame:Hide() end
           end
         end,
-        disabled = not UHCC_AnnoyMeMoreDB.enabled,
+        disabled = not parentAnnoy,
       },
+      --[[ Debug checkbox (hidden): re-enable with uhccammDebugEnabled() above.
       {
         kind = "checkbox",
         key = "UHCCAMM-DEBUG",
         label = "Debug",
-        description = "Show speed/fatigue debug overlay.",
+        description = "Show speed/fatigue debug overlay (works without Fatigue).",
         get = function() return UHCC_AnnoyMeMoreDB.debugEnabled end,
         set = function(v)
           UHCC_AnnoyMeMoreDB.debugEnabled = v and true or false
@@ -706,9 +824,13 @@ local function registerWithUHCC()
             if UHCCAMM.speedFrame then UHCCAMM.speedFrame:Hide() end
           end
         end,
-        disabled = not UHCC_AnnoyMeMoreDB.enabled,
+        disabled = not parentAnnoy,
       },
-      { kind = "info", text = "Tip: You can disable this addon’s behavior without disabling the addon." },
+      ]],
+      {
+        kind = "info",
+        text = "Fatigue requires Annoy me in the main UHCC settings.",
+      },
     }
   end)
 
@@ -720,6 +842,35 @@ local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGIN")
 f:SetScript("OnEvent", function()
   registerWithUHCC()
+
+  if type(hooksecurefunc) == "function" and _G.UHCC and type(UHCC.ToggleMainFrame) == "function" then
+    hooksecurefunc(UHCC, "ToggleMainFrame", function()
+      local function run()
+        uhccammTryInstallUhccSettingsHooksOnce()
+      end
+      if C_Timer and C_Timer.After then
+        C_Timer.After(0, run)
+      else
+        run()
+      end
+    end)
+  end
+  do
+    local poll = CreateFrame("Frame")
+    local acc = 0
+    poll:SetScript("OnUpdate", function(self, elapsed)
+      acc = acc + (tonumber(elapsed) or 0)
+      if uhccammTryInstallUhccSettingsHooksOnce() then
+        self:SetScript("OnUpdate", nil)
+        return
+      end
+      if acc >= 90 then
+        self:SetScript("OnUpdate", nil)
+      end
+    end)
+  end
+  uhccammTryInstallUhccSettingsHooksOnce()
+
   -- Restore last fatigue value (1s granularity persistence).
   uhccammRestoreFatigueFromDB()
     -- Sync exhausted icon immediately after restore.
@@ -775,6 +926,11 @@ f:SetScript("OnEvent", function()
         elseif token == "STAND" then
           setPosture("stand")
         end
+      end)
+    end
+    if type(JumpOrAscendStart) == "function" then
+      hooksecurefunc("JumpOrAscendStart", function()
+        uhccammApplyJumpFatigue()
       end)
     end
   end
@@ -864,7 +1020,7 @@ f:SetScript("OnEvent", function()
 
       if apply then
         local minV = uhccammHiddenStartValue()
-        UHCCAMM.fatigue = clamp((tonumber(UHCCAMM.fatigue) or minV) - 10, minV, 100)
+        UHCCAMM.fatigue = clamp((tonumber(UHCCAMM.fatigue) or minV) - 10, minV, uhccammFatigueMax())
         createFatigueBar()
         updateFatigueBar()
       end
@@ -872,20 +1028,47 @@ f:SetScript("OnEvent", function()
   end)
 end)
 
--- 60 FPS-style fatigue loop (quantized).
+-- 60 FPS-style fatigue loop (quantized). When debug mode is re-enabled, restore dbg-only tick branch below.
 local ticker = CreateFrame("Frame")
 ticker.UHCCAMM_saveAcc = 0
+ticker.UHCCAMM_idleAcc = 0
 ticker:SetScript("OnUpdate", function(_, elapsed)
-  if not uhccammFatigueEnabled() then return end
-  UHCCAMM.tickAcc = (UHCCAMM.tickAcc or 0) + (tonumber(elapsed) or 0)
-  ticker.UHCCAMM_saveAcc = (ticker.UHCCAMM_saveAcc or 0) + (tonumber(elapsed) or 0)
+  elapsed = tonumber(elapsed) or 0
+  local fatOn = uhccammFatigueEnabled()
+
+  if not fatOn then
+    ticker.UHCCAMM_idleAcc = (ticker.UHCCAMM_idleAcc or 0) + elapsed
+    if ticker.UHCCAMM_idleAcc >= 0.2 then
+      ticker.UHCCAMM_idleAcc = 0
+      createFatigueBar()
+      updateFatigueBar()
+      if UHCCAMM.speedFrame then UHCCAMM.speedFrame:Hide() end
+    end
+    return
+  end
+  ticker.UHCCAMM_idleAcc = 0
+
+  --[[ Debug overlay tick without Fatigue:
+  local dbgWanted = uhccammDebugEnabled()
+  if dbgWanted and not fatOn then
+    ticker.UHCCAMM_dbgAcc = (ticker.UHCCAMM_dbgAcc or 0) + elapsed
+    local dbgStep = 1 / 20
+    while ticker.UHCCAMM_dbgAcc >= dbgStep do
+      ticker.UHCCAMM_dbgAcc = ticker.UHCCAMM_dbgAcc - dbgStep
+      fatigueTick60()
+    end
+    return
+  end
+  ]]
+
+  UHCCAMM.tickAcc = (UHCCAMM.tickAcc or 0) + elapsed
+  ticker.UHCCAMM_saveAcc = (ticker.UHCCAMM_saveAcc or 0) + elapsed
   local step = 1 / 60
   while UHCCAMM.tickAcc >= step do
     UHCCAMM.tickAcc = UHCCAMM.tickAcc - step
     fatigueTick60()
   end
 
-  -- Persist at most once per second (cheap, prevents /reload "reset").
   if (ticker.UHCCAMM_saveAcc or 0) >= 1 then
     ticker.UHCCAMM_saveAcc = 0
     uhccammSaveFatigueToDB(GetTime and GetTime())
