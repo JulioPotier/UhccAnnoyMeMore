@@ -811,22 +811,7 @@ local function registerWithUHCC()
         end,
         disabled = not parentAnnoy,
       },
-      --[[ Debug checkbox (hidden): re-enable with uhccammDebugEnabled() above.
-      {
-        kind = "checkbox",
-        key = "UHCCAMM-DEBUG",
-        label = "Debug",
-        description = "Show speed/fatigue debug overlay (works without Fatigue).",
-        get = function() return UHCC_AnnoyMeMoreDB.debugEnabled end,
-        set = function(v)
-          UHCC_AnnoyMeMoreDB.debugEnabled = v and true or false
-          if not UHCC_AnnoyMeMoreDB.debugEnabled then
-            if UHCCAMM.speedFrame then UHCCAMM.speedFrame:Hide() end
-          end
-        end,
-        disabled = not parentAnnoy,
-      },
-      ]],
+      -- Debug settings checkbox was here; re-add a "UHCCAMM-DEBUG" checkbox when uhccammDebugEnabled() is restored.
       {
         kind = "info",
         text = "Fatigue requires Annoy me in the main UHCC settings.",
