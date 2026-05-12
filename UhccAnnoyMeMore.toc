@@ -2,7 +2,7 @@
 ## Title: UHCC - Annoy Me More
 ## Notes: Extra settings that extend UltimateHardcoreChallengeUI.
 ## Author: Kirby2112
-## Version: 0.1.0
+## Version: 0.3.0
 ## RequiredDeps: UltimateHardcoreChallengeUI
 ## SavedVariablesPerCharacter: UHCC_AnnoyMeMoreDB
 

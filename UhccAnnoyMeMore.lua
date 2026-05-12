@@ -21,11 +21,25 @@ local UHCCAMM = {
   lastEmoteToken = nil,
   hotFirstTickAt = {}, -- key -> last applied time (periodic heals: only first tick counts)
   lastJumpFatigueAt = 0,
+  -- Consume now (drink/food timers)
+  lastDrinking = false,
+  lastEating = false,
+  drinkSatisfyAccum = 0,
+  foodSatisfyAccum = 0,
+  consumeDrinkPanel = nil,
+  consumeDrinkStatus = nil,
+  consumeFoodPanel = nil,
+  consumeFoodStatus = nil,
+  consumePanicFrame = nil,
+  consumeBuffCacheAt = 0,
+  consumeBuffDrinking = false,
+  consumeBuffEating = false,
 }
 
 local function ensureDB()
   if type(UHCC_AnnoyMeMoreDB) ~= "table" then UHCC_AnnoyMeMoreDB = {} end
   if type(UHCC_AnnoyMeMoreDB.fatigueEnabled) ~= "boolean" then UHCC_AnnoyMeMoreDB.fatigueEnabled = false end
+  if type(UHCC_AnnoyMeMoreDB.consumeNowEnabled) ~= "boolean" then UHCC_AnnoyMeMoreDB.consumeNowEnabled = false end
   if type(UHCC_AnnoyMeMoreDB.debugEnabled) ~= "boolean" then UHCC_AnnoyMeMoreDB.debugEnabled = false end
   if type(UHCC_AnnoyMeMoreDB.fatigueValue) ~= "number" then UHCC_AnnoyMeMoreDB.fatigueValue = nil end
   if type(UHCC_AnnoyMeMoreDB.fatigueSavedAt) ~= "number" then UHCC_AnnoyMeMoreDB.fatigueSavedAt = nil end
@@ -35,6 +49,16 @@ local function ensureDB()
   if type(UHCC_AnnoyMeMoreDB.fatigueBarRelPoint) ~= "string" then UHCC_AnnoyMeMoreDB.fatigueBarRelPoint = "TOP" end
   if type(UHCC_AnnoyMeMoreDB.fatigueBarX) ~= "number" then UHCC_AnnoyMeMoreDB.fatigueBarX = 0 end
   if type(UHCC_AnnoyMeMoreDB.fatigueBarY) ~= "number" then UHCC_AnnoyMeMoreDB.fatigueBarY = -120 end
+  if type(UHCC_AnnoyMeMoreDB.consumeDrinkDeadline) ~= "number" then UHCC_AnnoyMeMoreDB.consumeDrinkDeadline = nil end
+  if type(UHCC_AnnoyMeMoreDB.consumeFoodDeadline) ~= "number" then UHCC_AnnoyMeMoreDB.consumeFoodDeadline = nil end
+  if type(UHCC_AnnoyMeMoreDB.consumeDrinkBarPoint) ~= "string" then UHCC_AnnoyMeMoreDB.consumeDrinkBarPoint = "TOP" end
+  if type(UHCC_AnnoyMeMoreDB.consumeDrinkBarRelPoint) ~= "string" then UHCC_AnnoyMeMoreDB.consumeDrinkBarRelPoint = "TOP" end
+  if type(UHCC_AnnoyMeMoreDB.consumeDrinkBarX) ~= "number" then UHCC_AnnoyMeMoreDB.consumeDrinkBarX = 0 end
+  if type(UHCC_AnnoyMeMoreDB.consumeDrinkBarY) ~= "number" then UHCC_AnnoyMeMoreDB.consumeDrinkBarY = -185 end
+  if type(UHCC_AnnoyMeMoreDB.consumeFoodBarPoint) ~= "string" then UHCC_AnnoyMeMoreDB.consumeFoodBarPoint = "TOP" end
+  if type(UHCC_AnnoyMeMoreDB.consumeFoodBarRelPoint) ~= "string" then UHCC_AnnoyMeMoreDB.consumeFoodBarRelPoint = "TOP" end
+  if type(UHCC_AnnoyMeMoreDB.consumeFoodBarX) ~= "number" then UHCC_AnnoyMeMoreDB.consumeFoodBarX = 0 end
+  if type(UHCC_AnnoyMeMoreDB.consumeFoodBarY) ~= "number" then UHCC_AnnoyMeMoreDB.consumeFoodBarY = -250 end
 end
 
 -- Mirrors UltimateHardcoreChallengeUI `uhccAnnoyEnabled()` (Annoy me checkbox); do not modify that addon.
@@ -50,13 +74,23 @@ local function uhccammFatigueEnabled()
   return uhccParentAnnoyEnabled() and (UHCC_AnnoyMeMoreDB.fatigueEnabled == true)
 end
 
--- Debug overlay is disabled for normal play. To work on it again, replace the body with the block below.
+local function uhccammConsumeNowEnabled()
+  ensureDB()
+  return uhccParentAnnoyEnabled() and (UHCC_AnnoyMeMoreDB.consumeNowEnabled == true)
+end
+
+-- Debug overlay: only for character "Macaronade" (dev build), still gated by Annoy me + checkbox.
+local UHCCAMM_DEBUG_PLAYER_NAME = "Macaronade"
+
+local function uhccammDebugCharacterUnlocked()
+  local n = UnitName and UnitName("player")
+  return type(n) == "string" and n == UHCCAMM_DEBUG_PLAYER_NAME
+end
+
 local function uhccammDebugEnabled()
-  return false
-  --[[
+  if not uhccammDebugCharacterUnlocked() then return false end
   ensureDB()
   return uhccParentAnnoyEnabled() and (UHCC_AnnoyMeMoreDB.debugEnabled == true)
-  ]]
 end
 
 local function uhccammPlayerLevel()
@@ -83,27 +117,138 @@ local function clamp(v, mn, mx)
   return v
 end
 
+-- Consume now: countdown -> 30s urgency bar -> panic until 10s drink/eat (consecutive).
+local UHCCAMM_CONSUME_DRINK_PERIOD = 18 * 60
+local UHCCAMM_CONSUME_FOOD_PERIOD = 26 * 60
+local UHCCAMM_CONSUME_URGENCY_SEC = 30
+local UHCCAMM_CONSUME_SATISFY_SEC = 10
+
+local function uhccammGetServerNow()
+  if GetServerTime then
+    local t = GetServerTime()
+    if type(t) == "number" and t > 0 then return t end
+  end
+  return (time and time()) or 0
+end
+
+local function uhccammConsumePhase(deadline)
+  deadline = tonumber(deadline)
+  if deadline == nil then return "countdown" end
+  local now = uhccammGetServerNow()
+  if now < deadline then return "countdown" end
+  if now < deadline + UHCCAMM_CONSUME_URGENCY_SEC then return "urgency" end
+  return "panic"
+end
+
+local function uhccammEnsureConsumeDeadlines()
+  ensureDB()
+  local now = uhccammGetServerNow()
+  if type(UHCC_AnnoyMeMoreDB.consumeDrinkDeadline) ~= "number" then
+    UHCC_AnnoyMeMoreDB.consumeDrinkDeadline = now + UHCCAMM_CONSUME_DRINK_PERIOD
+  end
+  if type(UHCC_AnnoyMeMoreDB.consumeFoodDeadline) ~= "number" then
+    UHCC_AnnoyMeMoreDB.consumeFoodDeadline = now + UHCCAMM_CONSUME_FOOD_PERIOD
+  end
+end
+
+-- On logout/reload: store time-until-panic; on login rebuild absolute deadlines so offline time does not advance timers.
+local function uhccammSaveConsumePauseOnLogout()
+  ensureDB()
+  local now = uhccammGetServerNow()
+  local function packAxis(deadlineKey, resumeSecKey, resumePanicKey)
+    local d = tonumber(UHCC_AnnoyMeMoreDB[deadlineKey])
+    if not d then
+      UHCC_AnnoyMeMoreDB[resumeSecKey] = nil
+      UHCC_AnnoyMeMoreDB[resumePanicKey] = nil
+      return
+    end
+    local panicAt = d + UHCCAMM_CONSUME_URGENCY_SEC
+    local r = panicAt - now
+    if r > 0 then
+      UHCC_AnnoyMeMoreDB[resumeSecKey] = math.max(0, math.floor(r + 0.5))
+      UHCC_AnnoyMeMoreDB[resumePanicKey] = false
+    else
+      UHCC_AnnoyMeMoreDB[resumeSecKey] = 0
+      UHCC_AnnoyMeMoreDB[resumePanicKey] = true
+    end
+  end
+  packAxis("consumeDrinkDeadline", "consumeDrinkResumeSec", "consumeDrinkResumePanic")
+  packAxis("consumeFoodDeadline", "consumeFoodResumeSec", "consumeFoodResumePanic")
+end
+
+local function uhccammApplyConsumeResumeAfterReconnect()
+  ensureDB()
+  local now = uhccammGetServerNow()
+  local function applyAxis(deadlineKey, resumeSecKey, resumePanicKey)
+    if type(UHCC_AnnoyMeMoreDB[resumeSecKey]) ~= "number" then return end
+    if UHCC_AnnoyMeMoreDB[resumePanicKey] == true then
+      UHCC_AnnoyMeMoreDB[deadlineKey] = now - UHCCAMM_CONSUME_URGENCY_SEC - 2
+    else
+      local r = tonumber(UHCC_AnnoyMeMoreDB[resumeSecKey]) or 0
+      UHCC_AnnoyMeMoreDB[deadlineKey] = now + r - UHCCAMM_CONSUME_URGENCY_SEC
+    end
+    UHCC_AnnoyMeMoreDB[resumeSecKey] = nil
+    UHCC_AnnoyMeMoreDB[resumePanicKey] = nil
+  end
+  applyAxis("consumeDrinkDeadline", "consumeDrinkResumeSec", "consumeDrinkResumePanic")
+  applyAxis("consumeFoodDeadline", "consumeFoodResumeSec", "consumeFoodResumePanic")
+end
+
 local function uhccammIsInCombat()
   return (UnitAffectingCombat and UnitAffectingCombat("player")) and true or false
 end
 
-local function uhccammIsEatingOrDrinking()
+local function uhccammIsEating()
   if not UnitBuff then return false end
   for i = 1, 40 do
     local name, icon = UnitBuff("player", i)
     if not name then break end
     local n = tostring(name):lower()
-    if n:find("food", 1, true) or n:find("drink", 1, true) then
+    if n:find("food", 1, true) then return true end
+    if type(icon) == "string" and icon:find("INV_Misc_Food", 1, true) then
       return true
-    end
-    if type(icon) == "string" then
-      -- Heuristic: most food/drink buffs use these icon folders.
-      if icon:find("INV_Drink", 1, true) or icon:find("INV_Misc_Food", 1, true) then
-        return true
-      end
     end
   end
   return false
+end
+
+local function uhccammIsDrinking()
+  if not UnitBuff then return false end
+  for i = 1, 40 do
+    local name, icon = UnitBuff("player", i)
+    if not name then break end
+    local n = tostring(name):lower()
+    if n:find("drink", 1, true) then return true end
+    if type(icon) == "string" and icon:find("INV_Drink", 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
+local function uhccammIsEatingOrDrinking()
+  return uhccammIsEating() or uhccammIsDrinking()
+end
+
+-- Consume tick only: refresh drink/food buff detection at ~10 Hz (full scan stays on fatigue path).
+local UHCCAMM_CONSUME_BUFF_SCAN_INTERVAL = 0.1
+
+local function uhccammConsumeRefreshBuffCacheIfDue()
+  local t = (GetTime and GetTime()) or 0
+  if (t - (UHCCAMM.consumeBuffCacheAt or 0)) < UHCCAMM_CONSUME_BUFF_SCAN_INTERVAL then return end
+  UHCCAMM.consumeBuffCacheAt = t
+  UHCCAMM.consumeBuffDrinking = uhccammIsDrinking()
+  UHCCAMM.consumeBuffEating = uhccammIsEating()
+end
+
+local function uhccammConsumeCachedIsDrinking()
+  uhccammConsumeRefreshBuffCacheIfDue()
+  return UHCCAMM.consumeBuffDrinking
+end
+
+local function uhccammConsumeCachedIsEating()
+  uhccammConsumeRefreshBuffCacheIfDue()
+  return UHCCAMM.consumeBuffEating
 end
 
 local function uhccammIsLaying()
@@ -165,6 +310,7 @@ end
 
 -- Forward declarations (used by slash command handler).
 local createFatigueBar, updateFatigueBar
+local createConsumeDrinkBar, createConsumeFoodBar, updateConsumeBarsAndPanic, uhccammConsumeOnTick
 
 local function uhccammApplyFatigueValue(v)
   local minV = uhccammHiddenStartValue()
@@ -195,42 +341,6 @@ local function uhccammApplyJumpFatigue()
   createFatigueBar()
   updateFatigueBar()
   uhccammSaveFatigueToDB(now)
-end
-
-local UHCCAMM_SLASH_WRAPPED = false
-local function uhccammTryWrapUhccSlash()
-  if UHCCAMM_SLASH_WRAPPED then return true end
-  if not SlashCmdList or type(SlashCmdList["UHCC"]) ~= "function" then return false end
-
-  local prev = SlashCmdList["UHCC"]
-
-  local function trim(s)
-    return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
-  end
-
-  SlashCmdList["UHCC"] = function(msg)
-    local m = trim(msg)
-    local low = string.lower(m)
-    local n = low:match("^fatigue%s+(-?%d+)$")
-    if n then
-      if not uhccammFatigueEnabled() then
-        print("|cffff3333UHCCAMM|r: Enable UHCC Annoy me, then Fatigue in Annoy Me More.")
-        return
-      end
-      local iv = tonumber(n)
-      if iv == nil then
-        print("|cffff3333UHCCAMM|r: Usage: /uhcc fatigue n")
-        return
-      end
-      uhccammApplyFatigueValue(iv)
-      print(("|cffff3333UHCCAMM|r: Fatigue set to %d"):format(iv))
-      return
-    end
-    return prev(msg)
-  end
-
-  UHCCAMM_SLASH_WRAPPED = true
-  return true
 end
 
 local UHCCAMM_BANDAGE_SPELLIDS = {
@@ -502,12 +612,349 @@ local function setFatiguePanelShown(shown)
   end
 end
 
+local function uhccammConsumeBarFactory(which)
+  local isDrink = which == "drink"
+  local panelKey = isDrink and "consumeDrinkPanel" or "consumeFoodPanel"
+  local statusKey = isDrink and "consumeDrinkStatus" or "consumeFoodStatus"
+  local frameName = isDrink and "UHCCAMM_ConsumeDrinkPanel" or "UHCCAMM_ConsumeFoodPanel"
+  local labelText = isDrink and "Drink now" or "Eat now"
+  local pointKey = isDrink and "consumeDrinkBarPoint" or "consumeFoodBarPoint"
+  local relKey = isDrink and "consumeDrinkBarRelPoint" or "consumeFoodBarRelPoint"
+  local xKey = isDrink and "consumeDrinkBarX" or "consumeFoodBarX"
+  local yKey = isDrink and "consumeDrinkBarY" or "consumeFoodBarY"
+  local defaultY = isDrink and -185 or -250
+
+  if UHCCAMM[panelKey] then return UHCCAMM[panelKey] end
+
+  local PAD = 10
+  local BAR_W, BAR_H = 240, 16
+  local LABEL_H = 14
+
+  local panel = CreateFrame("Frame", frameName, UIParent, "BackdropTemplate")
+  panel:SetSize(BAR_W + PAD * 2, BAR_H + PAD * 2 + LABEL_H)
+  ensureDB()
+  panel:ClearAllPoints()
+  panel:SetPoint(
+    UHCC_AnnoyMeMoreDB[pointKey] or "TOP",
+    UIParent,
+    UHCC_AnnoyMeMoreDB[relKey] or "TOP",
+    tonumber(UHCC_AnnoyMeMoreDB[xKey]) or 0,
+    tonumber(UHCC_AnnoyMeMoreDB[yKey]) or defaultY
+  )
+  panel:SetFrameStrata("HIGH")
+  panel:SetClampedToScreen(true)
+  panel:SetMovable(true)
+  panel:EnableMouse(true)
+  panel:RegisterForDrag("LeftButton")
+  panel:SetBackdrop({
+    bgFile = "Interface\\FrameGeneral\\UI-Background-Marble",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    edgeSize = 12,
+    insets = { left = 3, right = 3, top = 3, bottom = 3 },
+  })
+  panel:SetBackdropColor(1, 1, 1, 0.65)
+  panel:SetBackdropBorderColor(1, 1, 1, 0.75)
+  panel:SetAlpha(1)
+
+  panel:SetScript("OnDragStart", function(self)
+    if not IsAltKeyDown or not IsAltKeyDown() then return end
+    self:Show()
+    self:SetAlpha(1)
+    self:StartMoving()
+  end)
+  panel:SetScript("OnDragStop", function(self)
+    if self:IsMoving() then
+      self:StopMovingOrSizing()
+      ensureDB()
+      local p, _, rp, x, y = self:GetPoint(1)
+      UHCC_AnnoyMeMoreDB[pointKey] = p or "TOP"
+      UHCC_AnnoyMeMoreDB[relKey] = rp or "TOP"
+      UHCC_AnnoyMeMoreDB[xKey] = tonumber(x) or 0
+      UHCC_AnnoyMeMoreDB[yKey] = tonumber(y) or defaultY
+    end
+  end)
+
+  local label = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  label:SetPoint("TOPLEFT", panel, "TOPLEFT", PAD, -6)
+  label:SetJustifyH("LEFT")
+  label:SetTextColor(1, 0.82, 0, 1)
+  label:SetText(labelText)
+
+  local inner = CreateFrame("Frame", nil, panel)
+  inner:SetSize(BAR_W, BAR_H)
+  inner:SetPoint("TOPLEFT", panel, "TOPLEFT", PAD, -(PAD + LABEL_H))
+
+  local bg = inner:CreateTexture(nil, "BACKGROUND")
+  bg:SetAllPoints(true)
+  bg:SetColorTexture(0, 0, 0, 0.55)
+
+  local bar = CreateFrame("StatusBar", nil, inner)
+  bar:SetAllPoints(true)
+  bar:SetMinMaxValues(0, 100)
+  bar:SetValue(0)
+  bar:SetStatusBarTexture("Interface\\TARGETINGFRAME\\UI-StatusBar")
+  if isDrink then
+    bar:SetStatusBarColor(0.25, 0.55, 1.0, 1)
+  else
+    bar:SetStatusBarColor(0.85, 0.55, 0.2, 1)
+  end
+
+  local bd = CreateFrame("Frame", nil, inner, "BackdropTemplate")
+  bd:SetAllPoints(true)
+  bd:SetBackdrop({
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    edgeSize = 12,
+    insets = { left = 2, right = 2, top = 2, bottom = 2 },
+  })
+  bd:SetBackdropBorderColor(1, 1, 1, 0.6)
+
+  panel:Hide()
+  UHCCAMM[panelKey] = panel
+  UHCCAMM[statusKey] = bar
+  return panel
+end
+
+createConsumeDrinkBar = function()
+  return uhccammConsumeBarFactory("drink")
+end
+
+createConsumeFoodBar = function()
+  return uhccammConsumeBarFactory("food")
+end
+
+local function ensureConsumePanicFrame()
+  if UHCCAMM.consumePanicFrame then return UHCCAMM.consumePanicFrame end
+  local f = CreateFrame("Frame", "UHCCAMM_ConsumePanic", UIParent)
+  f:SetAllPoints(UIParent)
+  f:SetFrameStrata("FULLSCREEN_DIALOG")
+  f:SetFrameLevel(1001)
+  f:EnableMouse(false)
+
+  local bg = f:CreateTexture(nil, "BACKGROUND")
+  bg:SetAllPoints(true)
+  bg:SetColorTexture(1, 0, 0, 0.22)
+  f.bg = bg
+
+  local msg = f:CreateFontString(nil, "OVERLAY", "GameFontNormalHuge")
+  msg:SetPoint("CENTER", f, "CENTER", 0, 12)
+  msg:SetTextColor(1, 0.1, 0.1, 1)
+  msg:SetText("You must drink")
+  f.msg = msg
+
+  local msg2 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalHuge")
+  msg2:SetPoint("TOP", msg, "BOTTOM", 0, -8)
+  msg2:SetTextColor(1, 0.1, 0.1, 1)
+  msg2:SetText("You must eat")
+  msg2:Hide()
+  f.msg2 = msg2
+
+  f:Hide()
+  UHCCAMM.consumePanicFrame = f
+  return f
+end
+
+updateConsumeBarsAndPanic = function()
+  if not uhccammConsumeNowEnabled() then
+    if UHCCAMM.consumeDrinkPanel then UHCCAMM.consumeDrinkPanel:Hide() end
+    if UHCCAMM.consumeFoodPanel then UHCCAMM.consumeFoodPanel:Hide() end
+    if UHCCAMM.consumePanicFrame then UHCCAMM.consumePanicFrame:Hide() end
+    return
+  end
+
+  uhccammEnsureConsumeDeadlines()
+  local now = uhccammGetServerNow()
+  local dd = tonumber(UHCC_AnnoyMeMoreDB.consumeDrinkDeadline)
+  local fd = tonumber(UHCC_AnnoyMeMoreDB.consumeFoodDeadline)
+  local dPh = uhccammConsumePhase(dd)
+  local fPh = uhccammConsumePhase(fd)
+
+  createConsumeDrinkBar()
+  createConsumeFoodBar()
+
+  if dPh == "urgency" and UHCCAMM.consumeDrinkStatus and dd then
+    local t = (now - dd) / UHCCAMM_CONSUME_URGENCY_SEC * 100
+    UHCCAMM.consumeDrinkStatus:SetValue(clamp(t, 0, 100))
+    UHCCAMM.consumeDrinkPanel:Show()
+  elseif UHCCAMM.consumeDrinkPanel then
+    UHCCAMM.consumeDrinkPanel:Hide()
+  end
+
+  if fPh == "urgency" and UHCCAMM.consumeFoodStatus and fd then
+    local t = (now - fd) / UHCCAMM_CONSUME_URGENCY_SEC * 100
+    UHCCAMM.consumeFoodStatus:SetValue(clamp(t, 0, 100))
+    UHCCAMM.consumeFoodPanel:Show()
+  elseif UHCCAMM.consumeFoodPanel then
+    UHCCAMM.consumeFoodPanel:Hide()
+  end
+
+  local panicD = dPh == "panic"
+  local panicF = fPh == "panic"
+  if panicD or panicF then
+    local fr = ensureConsumePanicFrame()
+    if panicD and panicF then
+      fr.msg:SetText("You must drink")
+      fr.msg2:SetText("You must eat")
+      fr.msg2:Show()
+    elseif panicD then
+      fr.msg:SetText("You must drink")
+      fr.msg2:Hide()
+    else
+      fr.msg:SetText("You must eat")
+      fr.msg2:Hide()
+    end
+    fr.msg:ClearAllPoints()
+    if panicD and panicF then
+      fr.msg:SetPoint("CENTER", fr, "CENTER", 0, 12)
+    else
+      fr.msg:SetPoint("CENTER", fr, "CENTER", 0, 0)
+    end
+    fr:Show()
+    fr:SetAlpha(1)
+    if fr.bg then fr.bg:SetColorTexture(1, 0, 0, 0.22) end
+  elseif UHCCAMM.consumePanicFrame then
+    UHCCAMM.consumePanicFrame:Hide()
+  end
+end
+
+uhccammConsumeOnTick = function(elapsed)
+  elapsed = tonumber(elapsed) or 0
+  if not uhccammConsumeNowEnabled() then
+    UHCCAMM.lastDrinking = uhccammConsumeCachedIsDrinking()
+    UHCCAMM.lastEating = uhccammConsumeCachedIsEating()
+    updateConsumeBarsAndPanic()
+    return
+  end
+
+  uhccammEnsureConsumeDeadlines()
+  local now = uhccammGetServerNow()
+  local dd = tonumber(UHCC_AnnoyMeMoreDB.consumeDrinkDeadline)
+  local fd = tonumber(UHCC_AnnoyMeMoreDB.consumeFoodDeadline)
+  local drinking = uhccammConsumeCachedIsDrinking()
+  local eating = uhccammConsumeCachedIsEating()
+  local dPh = uhccammConsumePhase(dd)
+  local fPh = uhccammConsumePhase(fd)
+
+  if dPh == "urgency" or dPh == "panic" then
+    if drinking then
+      UHCCAMM.drinkSatisfyAccum = (UHCCAMM.drinkSatisfyAccum or 0) + elapsed
+      if UHCCAMM.drinkSatisfyAccum >= UHCCAMM_CONSUME_SATISFY_SEC then
+        UHCC_AnnoyMeMoreDB.consumeDrinkDeadline = now + UHCCAMM_CONSUME_DRINK_PERIOD
+        UHCCAMM.drinkSatisfyAccum = 0
+      end
+    else
+      UHCCAMM.drinkSatisfyAccum = 0
+    end
+  else
+    UHCCAMM.drinkSatisfyAccum = 0
+  end
+
+  if fPh == "urgency" or fPh == "panic" then
+    if eating then
+      UHCCAMM.foodSatisfyAccum = (UHCCAMM.foodSatisfyAccum or 0) + elapsed
+      if UHCCAMM.foodSatisfyAccum >= UHCCAMM_CONSUME_SATISFY_SEC then
+        UHCC_AnnoyMeMoreDB.consumeFoodDeadline = now + UHCCAMM_CONSUME_FOOD_PERIOD
+        UHCCAMM.foodSatisfyAccum = 0
+      end
+    else
+      UHCCAMM.foodSatisfyAccum = 0
+    end
+  else
+    UHCCAMM.foodSatisfyAccum = 0
+  end
+
+  -- Countdown only: a sip resets the full period (urgency/panic need 10s consecutive, same rule).
+  if drinking and (not UHCCAMM.lastDrinking) and dPh == "countdown" then
+    UHCC_AnnoyMeMoreDB.consumeDrinkDeadline = now + UHCCAMM_CONSUME_DRINK_PERIOD
+  end
+  if eating and (not UHCCAMM.lastEating) and fPh == "countdown" then
+    UHCC_AnnoyMeMoreDB.consumeFoodDeadline = now + UHCCAMM_CONSUME_FOOD_PERIOD
+  end
+
+  UHCCAMM.lastDrinking = drinking
+  UHCCAMM.lastEating = eating
+
+  updateConsumeBarsAndPanic()
+end
+
+local UHCCAMM_SLASH_WRAPPED = false
+local function uhccammTryWrapUhccSlash()
+  if UHCCAMM_SLASH_WRAPPED then return true end
+  if not SlashCmdList or type(SlashCmdList["UHCC"]) ~= "function" then return false end
+
+  local prev = SlashCmdList["UHCC"]
+
+  local function trim(s)
+    return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+  end
+
+  SlashCmdList["UHCC"] = function(msg)
+    local m = trim(msg)
+    local low = string.lower(m)
+    local n = low:match("^fatigue%s+(-?%d+)$")
+    if n then
+      if not uhccammFatigueEnabled() then
+        print("|cffff3333UHCCAMM|r: Enable UHCC Annoy me, then Fatigue in Annoy Me More.")
+        return
+      end
+      local iv = tonumber(n)
+      if iv == nil then
+        print("|cffff3333UHCCAMM|r: Usage: /uhcc fatigue n")
+        return
+      end
+      uhccammApplyFatigueValue(iv)
+      print(("|cffff3333UHCCAMM|r: Fatigue set to %d"):format(iv))
+      return
+    end
+
+    local drinkSec = low:match("^drink%s+(%d+)$")
+    if drinkSec then
+      if not uhccammDebugEnabled() then
+        print("|cffff3333UHCCAMM|r: /uhcc drink n is debug-only (Macaronade + Debug overlay + Annoy me).")
+        return
+      end
+      local sec = tonumber(drinkSec) or 0
+      if sec <= 0 then
+        print("|cffff3333UHCCAMM|r: Usage: /uhcc drink seconds")
+        return
+      end
+      ensureDB()
+      UHCC_AnnoyMeMoreDB.consumeDrinkDeadline = uhccammGetServerNow() + math.floor(sec)
+      updateConsumeBarsAndPanic()
+      print(("|cffff3333UHCCAMM|r: Drink deadline in %d s (server time)."):format(sec))
+      return
+    end
+
+    local foodSec = low:match("^food%s+(%d+)$")
+    if foodSec then
+      if not uhccammDebugEnabled() then
+        print("|cffff3333UHCCAMM|r: /uhcc food n is debug-only (Macaronade + Debug overlay + Annoy me).")
+        return
+      end
+      local sec = tonumber(foodSec) or 0
+      if sec <= 0 then
+        print("|cffff3333UHCCAMM|r: Usage: /uhcc food seconds")
+        return
+      end
+      ensureDB()
+      UHCC_AnnoyMeMoreDB.consumeFoodDeadline = uhccammGetServerNow() + math.floor(sec)
+      updateConsumeBarsAndPanic()
+      print(("|cffff3333UHCCAMM|r: Food deadline in %d s (server time)."):format(sec))
+      return
+    end
+
+    return prev(msg)
+  end
+
+  UHCCAMM_SLASH_WRAPPED = true
+  return true
+end
+
 local function ensureSpeedDebugText()
   if UHCCAMM.speedFs then return UHCCAMM.speedFs end
 
   local f = CreateFrame("Frame", "UHCCAMM_SpeedDebugFrame", UIParent)
   f:SetPoint("TOP", UIParent, "TOP", 0, -20)
-  f:SetSize(360, 54)
+  f:SetSize(420, 86)
   f:SetFrameStrata("HIGH")
 
   local fs = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -558,8 +1005,22 @@ local function updateSpeedDebugText()
     d.lastHealText and tostring(d.lastHealText) or "",
     d.lastCleuText and tostring(d.lastCleuText) or ""
   )
+  uhccammEnsureConsumeDeadlines()
+  local nowS = uhccammGetServerNow()
+  local dd = tonumber(UHCC_AnnoyMeMoreDB.consumeDrinkDeadline) or 0
+  local fd = tonumber(UHCC_AnnoyMeMoreDB.consumeFoodDeadline) or 0
+  s = s
+    .. ("\nCONSUME D:%s %ds | F:%s %ds"):format(
+      uhccammConsumePhase(dd),
+      math.floor(dd - nowS),
+      uhccammConsumePhase(fd),
+      math.floor(fd - nowS)
+    )
   fs:SetText(s)
-  if UHCCAMM.speedFrame then UHCCAMM.speedFrame:Show() end
+  if UHCCAMM.speedFrame then
+    UHCCAMM.speedFrame:SetSize(420, 86)
+    UHCCAMM.speedFrame:Show()
+  end
 end
 
 updateFatigueBar = function()
@@ -623,13 +1084,11 @@ local function uhccammCaptureDebugSnapshot()
 end
 
 local function fatigueTick60()
-  --[[ Debug-only tick without Fatigue (disabled while uhccammDebugEnabled returns false):
   if uhccammDebugEnabled() and not uhccammFatigueEnabled() then
     uhccammCaptureDebugSnapshot()
     updateSpeedDebugText()
     return
   end
-  ]]
 
   if not uhccammFatigueEnabled() then
     UHCCAMM.fatigue = uhccammHiddenStartValue()
@@ -715,10 +1174,14 @@ local function uhccammSyncAnnoyDependentSettingsControls()
   if not mf or type(mf.UHCC_settingsControls) ~= "table" then return end
 
   local on = uhccParentAnnoyEnabled()
-  local keys = { "UHCCAMM-FATIGUE" } -- "UHCCAMM-DEBUG" removed while debug mode is hidden
+  local keys = { "UHCCAMM-FATIGUE", "UHCCAMM-CONSUME-NOW" }
+  if uhccammDebugCharacterUnlocked() then
+    keys[#keys + 1] = "UHCCAMM-DEBUG"
+  end
 
   if not on then
     UHCC_AnnoyMeMoreDB.fatigueEnabled = false
+    UHCC_AnnoyMeMoreDB.consumeNowEnabled = false
     UHCC_AnnoyMeMoreDB.debugEnabled = false
     UHCCAMM.fatigue = uhccammHiddenStartValue()
     if UHCCAMM.bar then setFatiguePanelShown(false) end
@@ -738,8 +1201,14 @@ local function uhccammSyncAnnoyDependentSettingsControls()
           cb.Text:SetTextColor(0.7, 0.7, 0.7, 1)
         end
       end
-      if cb.SetChecked and key == "UHCCAMM-FATIGUE" then
-        cb:SetChecked(on and (UHCC_AnnoyMeMoreDB.fatigueEnabled == true))
+      if cb.SetChecked then
+        if key == "UHCCAMM-FATIGUE" then
+          cb:SetChecked(on and (UHCC_AnnoyMeMoreDB.fatigueEnabled == true))
+        elseif key == "UHCCAMM-CONSUME-NOW" then
+          cb:SetChecked(on and (UHCC_AnnoyMeMoreDB.consumeNowEnabled == true))
+        elseif key == "UHCCAMM-DEBUG" then
+          cb:SetChecked(on and (UHCC_AnnoyMeMoreDB.debugEnabled == true))
+        end
       end
     end
   end
@@ -794,7 +1263,7 @@ local function registerWithUHCC()
   _G.UHCC:RegisterSettingsProvider("Annoy Me More", function()
     ensureDB()
     local parentAnnoy = uhccParentAnnoyEnabled()
-    return {
+    local rows = {
       {
         kind = "checkbox",
         key = "UHCCAMM-FATIGUE",
@@ -811,12 +1280,42 @@ local function registerWithUHCC()
         end,
         disabled = not parentAnnoy,
       },
-      -- Debug settings checkbox was here; re-add a "UHCCAMM-DEBUG" checkbox when uhccammDebugEnabled() is restored.
       {
-        kind = "info",
-        text = "Fatigue requires Annoy me in the main UHCC settings.",
+        kind = "checkbox",
+        key = "UHCCAMM-CONSUME-NOW",
+        label = "Consume now",
+        description = "Once in a while, you'll have to drink and eat, be prepared.",
+        get = function() return UHCC_AnnoyMeMoreDB.consumeNowEnabled end,
+        set = function(v)
+          UHCC_AnnoyMeMoreDB.consumeNowEnabled = v and true or false
+          if not UHCC_AnnoyMeMoreDB.consumeNowEnabled then
+            updateConsumeBarsAndPanic()
+          end
+        end,
+        disabled = not parentAnnoy,
       },
     }
+    if uhccammDebugCharacterUnlocked() then
+      rows[#rows + 1] = {
+        kind = "checkbox",
+        key = "UHCCAMM-DEBUG",
+        label = "Debug overlay",
+        description = "Developer-only speed / state readout (this character only).",
+        get = function() return UHCC_AnnoyMeMoreDB.debugEnabled end,
+        set = function(v)
+          UHCC_AnnoyMeMoreDB.debugEnabled = v and true or false
+          if not UHCC_AnnoyMeMoreDB.debugEnabled and UHCCAMM.speedFrame then
+            UHCCAMM.speedFrame:Hide()
+          end
+        end,
+        disabled = not parentAnnoy,
+      }
+    end
+    rows[#rows + 1] = {
+      kind = "info",
+      text = "Annoy Me More options require Annoy me in the main UHCC settings.",
+    }
+    return rows
   end)
 
   return true
@@ -825,7 +1324,13 @@ end
 -- Register after dependencies are loaded.
 local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGIN")
-f:SetScript("OnEvent", function()
+f:RegisterEvent("PLAYER_LOGOUT")
+f:SetScript("OnEvent", function(_, event)
+  if event == "PLAYER_LOGOUT" then
+    uhccammSaveConsumePauseOnLogout()
+    return
+  end
+
   registerWithUHCC()
 
   if type(hooksecurefunc) == "function" and _G.UHCC and type(UHCC.ToggleMainFrame) == "function" then
@@ -856,13 +1361,18 @@ f:SetScript("OnEvent", function()
   end
   uhccammTryInstallUhccSettingsHooksOnce()
 
+  UHCCAMM.consumeBuffCacheAt = 0
+  uhccammApplyConsumeResumeAfterReconnect()
+  uhccammEnsureConsumeDeadlines()
+
   -- Restore last fatigue value (1s granularity persistence).
   uhccammRestoreFatigueFromDB()
     -- Sync exhausted icon immediately after restore.
-    createFatigueBar()
-    updateFatigueBar()
+  createFatigueBar()
+  updateFatigueBar()
+  uhccammConsumeOnTick(0)
 
-  -- Extend /uhcc with: /uhcc fatigue n
+  -- Extend /uhcc with: /uhcc fatigue n, /uhcc drink n, /uhcc food n (debug)
   do
     if not uhccammTryWrapUhccSlash() then
       -- Retry a few times in case another addon reassigns /uhcc during login.
@@ -1013,15 +1523,27 @@ f:SetScript("OnEvent", function()
   end)
 end)
 
--- 60 FPS-style fatigue loop (quantized). When debug mode is re-enabled, restore dbg-only tick branch below.
+-- 60 FPS-style fatigue loop (quantized); debug-only path when Fatigue is off but debug overlay is on.
 local ticker = CreateFrame("Frame")
 ticker.UHCCAMM_saveAcc = 0
 ticker.UHCCAMM_idleAcc = 0
 ticker:SetScript("OnUpdate", function(_, elapsed)
   elapsed = tonumber(elapsed) or 0
+  uhccammConsumeOnTick(elapsed)
+
   local fatOn = uhccammFatigueEnabled()
+  local dbgWanted = uhccammDebugEnabled()
 
   if not fatOn then
+    if dbgWanted then
+      ticker.UHCCAMM_dbgAcc = (ticker.UHCCAMM_dbgAcc or 0) + elapsed
+      local dbgStep = 1 / 20
+      while ticker.UHCCAMM_dbgAcc >= dbgStep do
+        ticker.UHCCAMM_dbgAcc = ticker.UHCCAMM_dbgAcc - dbgStep
+        fatigueTick60()
+      end
+      return
+    end
     ticker.UHCCAMM_idleAcc = (ticker.UHCCAMM_idleAcc or 0) + elapsed
     if ticker.UHCCAMM_idleAcc >= 0.2 then
       ticker.UHCCAMM_idleAcc = 0
@@ -1032,19 +1554,6 @@ ticker:SetScript("OnUpdate", function(_, elapsed)
     return
   end
   ticker.UHCCAMM_idleAcc = 0
-
-  --[[ Debug overlay tick without Fatigue:
-  local dbgWanted = uhccammDebugEnabled()
-  if dbgWanted and not fatOn then
-    ticker.UHCCAMM_dbgAcc = (ticker.UHCCAMM_dbgAcc or 0) + elapsed
-    local dbgStep = 1 / 20
-    while ticker.UHCCAMM_dbgAcc >= dbgStep do
-      ticker.UHCCAMM_dbgAcc = ticker.UHCCAMM_dbgAcc - dbgStep
-      fatigueTick60()
-    end
-    return
-  end
-  ]]
 
   UHCCAMM.tickAcc = (UHCCAMM.tickAcc or 0) + elapsed
   ticker.UHCCAMM_saveAcc = (ticker.UHCCAMM_saveAcc or 0) + elapsed
