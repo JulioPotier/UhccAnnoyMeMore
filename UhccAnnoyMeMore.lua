@@ -364,6 +364,14 @@ local function uhccammIsMounted()
   return (IsMounted and IsMounted()) and true or false
 end
 
+-- Taxi / flight master route (gryphon, wyvern, etc.): player is carried, not exerting — recover like at rest.
+local function uhccammIsOnTaxiFlight()
+  if UnitOnTaxi and UnitOnTaxi("player") then
+    return true
+  end
+  return false
+end
+
 local function uhccammSpeedBonusBySpeed(speed)
   -- Locale-free approximation:
   -- If you're moving faster than normal run speed, treat it as "speed boost active" (+1 fatigue rate).
@@ -1107,6 +1115,16 @@ local function fatigueTick60()
   local EXH_DELTA = 0.5 -- debuff: +0.5 fatigue, -0.5 regen
 
   local speed, moving = uhccammCaptureDebugSnapshot()
+  -- High speed during taxi counts as "moving" for speed checks, but fatigue should drop like standing still.
+  if uhccammIsOnTaxiFlight() then
+    moving = false
+    if UHCCAMM.debug then
+      UHCCAMM.debug.moving = false
+      UHCCAMM.debug.taxiFlight = true
+    end
+  elseif UHCCAMM.debug then
+    UHCCAMM.debug.taxiFlight = false
+  end
 
   if not moving then
     -- In combat, fatigue does not go down (even if you're standing still).
